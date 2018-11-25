@@ -8,14 +8,20 @@ import (
 	"time"
 )
 
+// Matcher matches a connection based on its content.
 type Matcher func(io.Reader) bool
 
+// MatchWriter is a match that can also write response (say to do handshake).
 type MatchWriter func(io.Writer, io.Reader) bool
 
+// ErrorHandler handles an error and returns whether
+// the mux should continue serving the listener.
 type ErrorHandler func(error) bool
 
 var _ net.Error = ErrNotMatched{}
 
+// ErrNotMatched is returned whenever a connection is not matched by any of
+// the matchers registered in the multiplexer.
 type ErrNotMatched struct {
 	c net.Conn
 }
@@ -25,8 +31,10 @@ func (e ErrNotMatched) Error() string {
 		e.c.RemoteAddr())
 }
 
+// Temporary implements the net.Error interface.
 func (e ErrNotMatched) Temporary() bool { return true }
 
+// Timeout implements the net.Error interface.
 func (e ErrNotMatched) Timeout() bool { return false }
 
 type errListenerClosed string
@@ -35,14 +43,16 @@ func (e errListenerClosed) Error() string   { return string(e) }
 func (e errListenerClosed) Temporary() bool { return false }
 func (e errListenerClosed) Timeout() bool   { return false }
 
+// ErrListenerClosed is returned from muxListener.Accept when the underlying
+// listener is closed.
 var ErrListenerClosed = errListenerClosed("mux: listener closed")
 
 // for readability of readTimeout
 var noTimeout time.Duration
 
 // New instantiates a new connection multiplexer.
-func New(l net.Listener) *rpcMux {
-	return &rpcMux{
+func New(l net.Listener) CMux {
+	return &cMux{
 		root:        l,
 		bufLen:      1024,
 		errh:        func(_ error) bool { return true },
@@ -51,12 +61,27 @@ func New(l net.Listener) *rpcMux {
 	}
 }
 
-// rpcMux is a multiplexer for network connections.
-type RPrpcMux interface {
+// CMux is a multiplexer for network connections.
+type CMux interface {
+	// Match returns a net.Listener that sees (i.e., accepts) only
+	// the connections matched by at least one of the matcher.
+	//
+	// The order used to call Match determines the priority of matchers.
 	Match(...Matcher) net.Listener
+	// MatchWithWriters returns a net.Listener that accepts only the
+	// connections that matched by at least of the matcher writers.
+	//
+	// Prefer Matchers over MatchWriters, since the latter can write on the
+	// connection before the actual handler.
+	//
+	// The order used to call Match determines the priority of matchers.
 	MatchWithWriters(...MatchWriter) net.Listener
+	// Serve starts multiplexing the listener. Serve blocks and perhaps
+	// should be invoked concurrently within a go routine.
 	Serve() error
+	// HandleError registers an error handler that handles listener errors.
 	HandleError(ErrorHandler)
+	// sets a timeout for the read of matchers
 	SetReadTimeout(time.Duration)
 }
 
@@ -65,7 +90,7 @@ type matchersListener struct {
 	l  muxListener
 }
 
-type rpcMux struct {
+type cMux struct {
 	root        net.Listener
 	bufLen      int
 	errh        ErrorHandler
@@ -85,12 +110,12 @@ func matchersToMatchWriters(matchers []Matcher) []MatchWriter {
 	return mws
 }
 
-func (m *rpcMux) Match(matchers ...Matcher) net.Listener {
+func (m *cMux) Match(matchers ...Matcher) net.Listener {
 	mws := matchersToMatchWriters(matchers)
 	return m.MatchWithWriters(mws...)
 }
 
-func (m *rpcMux) MatchWithWriters(matchers ...MatchWriter) net.Listener {
+func (m *cMux) MatchWithWriters(matchers ...MatchWriter) net.Listener {
 	ml := muxListener{
 		Listener: m.root,
 		connc:    make(chan net.Conn, m.bufLen),
@@ -99,11 +124,11 @@ func (m *rpcMux) MatchWithWriters(matchers ...MatchWriter) net.Listener {
 	return ml
 }
 
-func (m *rpcMux) SetReadTimeout(t time.Duration) {
+func (m *cMux) SetReadTimeout(t time.Duration) {
 	m.readTimeout = t
 }
 
-func (m *rpcMux) Serve() error {
+func (m *cMux) Serve() error {
 	var wg sync.WaitGroup
 
 	defer func() {
@@ -133,7 +158,7 @@ func (m *rpcMux) Serve() error {
 	}
 }
 
-func (m *rpcMux) serve(c net.Conn, donec <-chan struct{}, wg *sync.WaitGroup) {
+func (m *cMux) serve(c net.Conn, donec <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	muc := newMuxConn(c)
@@ -165,11 +190,11 @@ func (m *rpcMux) serve(c net.Conn, donec <-chan struct{}, wg *sync.WaitGroup) {
 	}
 }
 
-func (m *rpcMux) HandleError(h ErrorHandler) {
+func (m *cMux) HandleError(h ErrorHandler) {
 	m.errh = h
 }
 
-func (m *rpcMux) handleErr(err error) bool {
+func (m *cMux) handleErr(err error) bool {
 	if !m.errh(err) {
 		return false
 	}
@@ -207,6 +232,16 @@ func newMuxConn(c net.Conn) *MuxConn {
 	}
 }
 
+// From the io.Reader documentation:
+//
+// When Read encounters an error or end-of-file condition after
+// successfully reading n > 0 bytes, it returns the number of
+// bytes read.  It may return the (non-nil) error from the same call
+// or return the error (and n == 0) from a subsequent call.
+// An instance of this general case is that a Reader returning
+// a non-zero number of bytes at the end of the input stream may
+// return either err == EOF or err == nil.  The next Read should
+// return 0, EOF.
 func (m *MuxConn) Read(p []byte) (int, error) {
 	return m.buf.Read(p)
 }
